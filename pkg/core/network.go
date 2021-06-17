@@ -20,9 +20,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pingcap/errors"
-
 	"github.com/chaos-mesh/chaos-mesh/pkg/chaosdaemon/pb"
+	"github.com/pingcap/errors"
 
 	"github.com/chaos-mesh/chaosd/pkg/utils"
 )
@@ -41,8 +40,14 @@ type NetworkCommand struct {
 	IPProtocol  string
 	Hostname    string
 
+	Direction string
+
 	// used for DNS attack
 	DNSServer string
+
+	// only the packet which match the tcp flag can be accepted, others will be dropped.
+	// only set when the IPProtocol is tcp, used for partition.
+	AcceptTCPFlags string
 }
 
 var _ AttackConfig = &NetworkCommand{}
@@ -53,6 +58,7 @@ const (
 	NetworkCorruptAction   = "corrupt"
 	NetworkDuplicateAction = "duplicate"
 	NetworkDNSAction       = "dns"
+	NetworkPartitionAction = "partition"
 )
 
 func (n *NetworkCommand) Validate() error {
@@ -66,6 +72,8 @@ func (n *NetworkCommand) Validate() error {
 		return n.validNetworkCommon()
 	case NetworkDNSAction:
 		return n.validNetworkDNS()
+	case NetworkPartitionAction:
+		return n.validNetworkPartition()
 	default:
 		return errors.Errorf("network action %s not supported", n.Action)
 	}
@@ -123,6 +131,30 @@ func (n *NetworkCommand) validNetworkCommon() error {
 	}
 
 	return checkProtocolAndPorts(n.IPProtocol, n.SourcePort, n.EgressPort)
+}
+
+func (n *NetworkCommand) validNetworkPartition() error {
+	if len(n.Device) == 0 {
+		return errors.New("device is required")
+	}
+
+	if !utils.CheckIPs(n.IPAddress) {
+		return errors.Errorf("ip addressed %s not valid", n.IPAddress)
+	}
+
+	if n.Direction != "to" && n.Direction != "from" {
+		return errors.Errorf("direction should be one of 'to' and 'from'")
+	}
+
+	if len(n.AcceptTCPFlags) > 0 && n.IPProtocol != "tcp" {
+		return errors.Errorf("protocol should be 'tcp' when set accept-tcp-flags")
+	}
+
+	if !utils.CheckIPProtocols(n.IPProtocol) {
+		return errors.Errorf("ip protocols %s not valid", n.IPProtocol)
+	}
+
+	return nil
 }
 
 func (n *NetworkCommand) validNetworkDNS() error {
@@ -296,6 +328,8 @@ func (n *NetworkCommand) ToTC(ipset string) (*pb.Tc, error) {
 		if netem, err = n.ToDuplicateNetem(); err != nil {
 			return nil, errors.WithStack(err)
 		}
+	case NetworkPartitionAction:
+
 	default:
 		return nil, errors.Errorf("action %s not supported", n.Action)
 	}
@@ -352,8 +386,43 @@ func (n *NetworkCommand) NeedApplyTC() bool {
 	}
 }
 
-func (n *NetworkCommand) ToChain() (*pb.Chain, error) {
-	return nil, nil
+func (n *NetworkCommand) ToChain(ipset string) ([]*pb.Chain, error) {
+	if n.Action != NetworkPartitionAction {
+		return nil, nil
+	}
+
+	var directionStr string
+	var directionChain pb.Chain_Direction
+	if n.Direction == "to" {
+		directionStr = "OUTPUT"
+		directionChain = pb.Chain_OUTPUT
+	} else if n.Direction == "from" {
+		directionStr = "INPUT"
+		directionChain = pb.Chain_INPUT
+	} else {
+		return nil, errors.New(fmt.Sprintf("direction %s not supported", n.Direction))
+	}
+
+	chains := make([]*pb.Chain, 0, 2)
+	if len(n.AcceptTCPFlags) > 0 {
+		chains = append(chains, &pb.Chain{
+			Name:      fmt.Sprintf("%s/0", directionStr),
+			Ipsets:    []string{ipset},
+			Direction: directionChain,
+			Protocol:  n.IPProtocol,
+			TcpFlags:  n.AcceptTCPFlags,
+			Target:    "ACCEPT",
+		})
+	}
+
+	chains = append(chains, &pb.Chain{
+		Name:      fmt.Sprintf("%s/1", directionStr),
+		Ipsets:    []string{ipset},
+		Direction: directionChain,
+		Target:    "DROP",
+	})
+
+	return chains, nil
 }
 
 func NewNetworkCommand() *NetworkCommand {
